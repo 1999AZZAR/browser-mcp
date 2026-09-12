@@ -23,7 +23,31 @@ const cache = require('../core/cache');
 const recorder = require('../core/recorder');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { validateURL } = require('../utils/url-validator');
+
+/**
+ * P1-C2/C3: capture provenance + artifact addressing for file-producing tools.
+ * Provenance shape mirrors researcher-mcp/src/provenance.ts and the
+ * HelaProvenanceRef in chaining-mcp/src/agent/hela-result.ts (duplicated —
+ * each MCP server builds independently). Captures are verbatim page state,
+ * hence confidence 1.0; freshness is always fresh (live page, not cache).
+ */
+function captureProvenance(page, confidence = 1.0) {
+    let url = '';
+    try { url = page.url(); } catch (_) { url = ''; }
+    return { source: url, retrieved_at: new Date().toISOString(), confidence, freshness: 'fresh' };
+}
+
+/** sha256 hex + byte size of a file on disk (artifact addressing). */
+function hashArtifact(filePath) {
+    const bytes = fs.readFileSync(filePath);
+    return {
+        uri: `file://${filePath}`,
+        sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+        size: fs.statSync(filePath).size,
+    };
+}
 
 // Tesseract.js is optional — OCR tools gracefully degrade if not installed.
 // This keeps the core bundle small while allowing OCR on demand.
@@ -1699,7 +1723,12 @@ async function handleToolCall(name, args) {
                 });
             }
 
-            return { content: [{ type: 'image', data: ss.toString('base64'), mimeType: 'image/png' }] };
+            // P1-C2: captures carry source provenance as a trailing text block.
+            const prov = captureProvenance(page);
+            return { content: [
+                { type: 'image', data: ss.toString('base64'), mimeType: 'image/png' },
+                { type: 'text', text: `Sources:\n- ${prov.source} (retrieved ${prov.retrieved_at}, confidence ${prov.confidence}, ${prov.freshness})` },
+            ] };
         }
         case 'browser_print_to_pdf': {
             const pdf = await page.pdf({
@@ -1711,7 +1740,8 @@ async function handleToolCall(name, args) {
             const dir = path.dirname(outputPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             fs.writeFileSync(outputPath, pdf);
-            return { content: [{ type: 'text', text: `PDF saved to ${outputPath} (${(pdf.length / 1024).toFixed(1)} KB)` }] };
+            const art = hashArtifact(outputPath);
+            return { content: [{ type: 'text', text: `PDF saved to ${outputPath} (${(pdf.length / 1024).toFixed(1)} KB) [sha256:${art.sha256}]` }] };
         }
         case 'browser_get_cookies': {
             const cookies = await page.context().cookies();
@@ -1910,9 +1940,13 @@ async function handleToolCall(name, args) {
 
             if (!args.includeAxTree) delete state.axTree;
 
+            // P1-C2: captures are verbatim page state — stamp source provenance.
+            state.provenance = captureProvenance(page);
+
             fs.writeFileSync(outputPath, JSON.stringify(state, null, 2));
-            const sizeKb = (fs.statSync(outputPath).size / 1024).toFixed(1);
-            return { content: [{ type: 'text', text: `State exported to ${outputPath} (${sizeKb} KB).` }] };
+            const art = hashArtifact(outputPath);
+            const sizeKb = (art.size / 1024).toFixed(1);
+            return { content: [{ type: 'text', text: `State exported to ${outputPath} (${sizeKb} KB) [sha256:${art.sha256}].` }] };
         }
         case 'browser_solve_captcha_grid': {
             const challengeFrame = await page.waitForSelector('iframe[src*="bframe"]', { timeout: 5000 }).catch(() => null);
@@ -2836,8 +2870,10 @@ async function handleToolCall(name, args) {
                 const savePath = args.savePath || defaultPath;
                 
                 await download.saveAs(savePath);
-                
-                return { content: [{ type: 'text', text: `Successfully downloaded file to: ${savePath}` }] };
+
+                // P1-C3: artifact addressing for the downloaded file.
+                const art = hashArtifact(savePath);
+                return { content: [{ type: 'text', text: `Successfully downloaded file to: ${savePath} (${(art.size / 1024).toFixed(1)} KB) [sha256:${art.sha256}]` }] };
             } catch (e) {
                 return { content: [{ type: 'text', text: `Failed to capture download: ${e.message}` }], isError: true };
             }

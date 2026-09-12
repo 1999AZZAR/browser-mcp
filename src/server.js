@@ -12,6 +12,7 @@ const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const { TOOLS, handleToolCall } = require('./tools');
+const { withEnvelope, errorResult } = require('./envelope');
 const browser = require('./core/browser');
 
 const server = new Server(
@@ -28,12 +29,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     try {
-        return await handleToolCall(name, args);
+        // P1-C1: HELA_ENVELOPE=true wraps in HelaResult, default is legacy raw.
+        return withEnvelope(name, await handleToolCall(name, args));
     } catch (e) {
-        return {
-            isError: true,
-            content: [{ type: 'text', text: `Error: ${e.message}` }]
-        };
+        return errorResult(name, e.message);
     }
 });
 
