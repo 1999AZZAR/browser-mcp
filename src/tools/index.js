@@ -24,7 +24,8 @@ const recorder = require('../core/recorder');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { validateURL } = require('../utils/url-validator');
+const { validateURL, resolveAndValidate } = require('../utils/url-validator');
+const { checkOutputPath, safeFilename } = require('../utils/path-guard');
 
 /**
  * P1-C2/C3: capture provenance + artifact addressing for file-producing tools.
@@ -460,7 +461,7 @@ const TOOLS = [
     },
     {
         name: 'browser_evaluate',
-        description: 'Execute arbitrary JavaScript in the page context and return the result. Supports async/await, multi-statement scripts, and passing serializable data via args.',
+        description: '[R3 Privileged] Execute arbitrary JavaScript in the page context and return the result. Requires HELA_BROWSER_ALLOW_EVAL=true. Supports async/await, multi-statement scripts, and passing serializable data via args.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -928,7 +929,7 @@ const TOOLS = [
     // ── Planner-Validator ─────────────────────────────────────────────────────
     {
         name: 'browser_assert',
-        description: 'Validate a condition on the current page. On failure, returns what is actually present to help re-plan. Use after actions to verify outcomes before continuing.',
+        description: 'Validate a condition on the current page. On failure, returns what is actually present to help re-plan. Use after actions to verify outcomes before continuing. Note: conditionType="js" requires HELA_BROWSER_ALLOW_EVAL=true (R3 privilege).',
         inputSchema: {
             type: 'object',
             properties: {
@@ -1210,9 +1211,11 @@ async function handleToolCall(name, args) {
     switch (name) {
         // Navigation
         case 'browser_navigate': {
-            // SSRF protection — validate URL before navigation
+            // SSRF protection — validate URL and resolve DNS before navigation
             try {
                 validateURL(args.url, { allowPrivate: allowPrivateIPs, allowAllSchemes });
+                const parsedUrl = new URL(args.url);
+                await resolveAndValidate(parsedUrl.hostname, { allowPrivate: allowPrivateIPs });
             } catch (e) {
                 return { content: [{ type: 'text', text: `URL blocked: ${e.message}` }], isError: true };
             }
@@ -1260,6 +1263,15 @@ async function handleToolCall(name, args) {
             }
         }
         case 'browser_new_tab': {
+            if (args.url) {
+                try {
+                    validateURL(args.url, { allowPrivate: allowPrivateIPs, allowAllSchemes });
+                    const parsedUrl = new URL(args.url);
+                    await resolveAndValidate(parsedUrl.hostname, { allowPrivate: allowPrivateIPs });
+                } catch (e) {
+                    return { content: [{ type: 'text', text: `URL blocked: ${e.message}` }], isError: true };
+                }
+            }
             const newPg = await newPage();
             if (args.url) await newPg.goto(args.url, { waitUntil: 'load' });
             return { content: [{ type: 'text', text: `Opened new tab${args.url ? ' at ' + args.url : ''}.` }] };
@@ -1731,12 +1743,17 @@ async function handleToolCall(name, args) {
             ] };
         }
         case 'browser_print_to_pdf': {
+            const outputPath = args.outputPath || path.join(__dirname, '../../pdfs', `${Date.now()}.pdf`);
+            try {
+                checkOutputPath(outputPath);
+            } catch (e) {
+                return { content: [{ type: 'text', text: `Output path blocked: ${e.message}` }], isError: true };
+            }
             const pdf = await page.pdf({
                 landscape: args.landscape ?? false,
                 printBackground: args.printBackground ?? true,
                 format: args.format ?? 'A4',
             });
-            const outputPath = args.outputPath || path.join(__dirname, '../../pdfs', `${Date.now()}.pdf`);
             const dir = path.dirname(outputPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             fs.writeFileSync(outputPath, pdf);
@@ -1748,6 +1765,12 @@ async function handleToolCall(name, args) {
             return { content: [{ type: 'text', text: JSON.stringify({ cookies }, null, 2) }] };
         }
         case 'browser_evaluate': {
+            if (process.env.HELA_BROWSER_ALLOW_EVAL !== 'true') {
+                return {
+                    content: [{ type: 'text', text: 'Evaluation blocked: browser_evaluate requires HELA_BROWSER_ALLOW_EVAL=true (R3 privilege).' }],
+                    isError: true,
+                };
+            }
             const result = await page.evaluate(async ([script, scriptArgs]) => {
                 try {
                     // eslint-disable-next-line no-new-func
@@ -1849,8 +1872,21 @@ async function handleToolCall(name, args) {
             return { content: [{ type: 'text', text: summary }] };
         }
         case 'browser_save_session': {
+            let safeName;
+            try {
+                safeName = safeFilename(args.name);
+            } catch (e) {
+                return { content: [{ type: 'text', text: `Invalid session name: ${e.message}` }], isError: true };
+            }
             const sessionDir = path.join(__dirname, '../../sessions');
-            if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+            if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+
+            const sessionPath = path.join(sessionDir, `${safeName}.json`);
+            try {
+                checkOutputPath(sessionPath);
+            } catch (e) {
+                return { content: [{ type: 'text', text: `Session path blocked: ${e.message}` }], isError: true };
+            }
 
             const cookies = await page.context().cookies();
             const sessionData = { cookies };
@@ -1863,14 +1899,26 @@ async function handleToolCall(name, args) {
                 }));
             }
 
-            fs.writeFileSync(path.join(sessionDir, `${args.name}.json`), JSON.stringify(sessionData, null, 2));
+            // Secret handling: save session containing auth credentials with owner-only (0600) permissions
+            fs.writeFileSync(sessionPath, JSON.stringify(sessionData, null, 2), { mode: 0o600 });
             const extras = args.includeStorage ? ' + localStorage/sessionStorage' : '';
-            return { content: [{ type: 'text', text: `Session "${args.name}" saved (cookies${extras}).` }] };
+            return { content: [{ type: 'text', text: `Session "${safeName}" saved (cookies${extras}).` }] };
         }
         case 'browser_load_session': {
-            const sessionPath = path.join(__dirname, '../../sessions', `${args.name}.json`);
+            let safeName;
+            try {
+                safeName = safeFilename(args.name);
+            } catch (e) {
+                return { content: [{ type: 'text', text: `Invalid session name: ${e.message}` }], isError: true };
+            }
+            const sessionPath = path.join(__dirname, '../../sessions', `${safeName}.json`);
+            try {
+                checkOutputPath(sessionPath);
+            } catch (e) {
+                return { content: [{ type: 'text', text: `Session path blocked: ${e.message}` }], isError: true };
+            }
             if (!fs.existsSync(sessionPath)) {
-                return { content: [{ type: 'text', text: `Session "${args.name}" not found.` }], isError: true };
+                return { content: [{ type: 'text', text: `Session "${safeName}" not found.` }], isError: true };
             }
 
             const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
@@ -1886,12 +1934,12 @@ async function handleToolCall(name, args) {
                         Object.entries(lsData).forEach(([k, v]) => localStorage.setItem(k, v));
                         Object.entries(ssData).forEach(([k, v]) => sessionStorage.setItem(k, v));
                     }, [ls, ss]);
-                    return { content: [{ type: 'text', text: `Session "${args.name}" loaded (cookies + localStorage/sessionStorage).` }] };
+                    return { content: [{ type: 'text', text: `Session "${safeName}" loaded (cookies + localStorage/sessionStorage).` }] };
                 }
-                return { content: [{ type: 'text', text: `Session "${args.name}" loaded (cookies only — storage skipped: page origin mismatch with saved origin "${origin}").` }] };
+                return { content: [{ type: 'text', text: `Session "${safeName}" loaded (cookies only — storage skipped: page origin mismatch with saved origin "${origin}").` }] };
             }
 
-            return { content: [{ type: 'text', text: `Session "${args.name}" loaded.` }] };
+            return { content: [{ type: 'text', text: `Session "${safeName}" loaded.` }] };
         }
         case 'browser_list_sessions': {
             const sessionDir = path.join(__dirname, '../../sessions');
@@ -1916,6 +1964,11 @@ async function handleToolCall(name, args) {
             if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir, { recursive: true });
 
             const outputPath = args.outputPath || path.join(exportDir, `state-${Date.now()}.json`);
+            try {
+                checkOutputPath(outputPath);
+            } catch (e) {
+                return { content: [{ type: 'text', text: `Output path blocked: ${e.message}` }], isError: true };
+            }
             const dir = path.dirname(outputPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
@@ -2153,10 +2206,21 @@ async function handleToolCall(name, args) {
                 }
 
                 if (save) {
+                    let safeName;
+                    try {
+                        safeName = safeFilename(macroName);
+                    } catch (e) {
+                        return { content: [{ type: 'text', text: `Invalid macro name: ${e.message}` }], isError: true };
+                    }
                     const dir = path.join(__dirname, '../../user_data/macros');
                     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
                     const ext = format === 'json' ? 'json' : 'spec.js';
-                    const filePath = path.join(dir, `${macroName}.${ext}`);
+                    const filePath = path.join(dir, `${safeName}.${ext}`);
+                    try {
+                        checkOutputPath(filePath);
+                    } catch (e) {
+                        return { content: [{ type: 'text', text: `Macro path blocked: ${e.message}` }], isError: true };
+                    }
                     fs.writeFileSync(filePath, output);
                     return { content: [{ type: 'text', text: `Macro saved: ${filePath}\n${actions.length} actions recorded.`, data: { filePath, actionCount: actions.length } }] };
                 }
@@ -2865,10 +2929,15 @@ async function handleToolCall(name, args) {
             
             try {
                 const download = await downloadPromise;
-                const path = require('path');
                 const defaultPath = path.join(process.cwd(), download.suggestedFilename());
-                const savePath = args.savePath || defaultPath;
-                
+                const savePath = args.savePath ? path.resolve(args.savePath) : defaultPath;
+                try {
+                    checkOutputPath(savePath);
+                } catch (err) {
+                    return { content: [{ type: 'text', text: `Download path blocked: ${err.message}` }], isError: true };
+                }
+                const dir = path.dirname(savePath);
+                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
                 await download.saveAs(savePath);
 
                 // P1-C3: artifact addressing for the downloaded file.
@@ -2963,6 +3032,11 @@ async function handleToolCall(name, args) {
             const script = recorder.generate(args.testName || 'recorded_session');
             if (!script) return { content: [{ type: 'text', text: 'No actions recorded. Interact with the browser first.' }] };
             if (args.outputPath) {
+                try {
+                    checkOutputPath(args.outputPath);
+                } catch (e) {
+                    return { content: [{ type: 'text', text: `Output path blocked: ${e.message}` }], isError: true };
+                }
                 const dir = path.dirname(args.outputPath);
                 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
                 fs.writeFileSync(args.outputPath, script);
@@ -3056,6 +3130,12 @@ async function handleToolCall(name, args) {
                 passed = url.includes(args.condition);
                 actual = url;
             } else if (type === 'js') {
+                if (process.env.HELA_BROWSER_ALLOW_EVAL !== 'true') {
+                    return {
+                        content: [{ type: 'text', text: 'Evaluation blocked: browser_assert with conditionType="js" requires HELA_BROWSER_ALLOW_EVAL=true (R3 privilege).' }],
+                        isError: true,
+                    };
+                }
                 const res = await page.evaluate(expr => {
                     // eslint-disable-next-line no-new-func
                     return new Function(`return (${expr})`)();
@@ -3429,6 +3509,11 @@ async function handleToolCall(name, args) {
             if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir, { recursive: true });
 
             const outputPath = args.outputPath || path.join(exportDir, `trace-${Date.now()}.zip`);
+            try {
+                checkOutputPath(outputPath);
+            } catch (e) {
+                return { content: [{ type: 'text', text: `Trace path blocked: ${e.message}` }], isError: true };
+            }
             const dir = path.dirname(outputPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 

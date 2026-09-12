@@ -298,6 +298,8 @@ Register in your MCP client config:
 | `BROWSER_LAUNCH_BACKOFF` | `1000` | Base delay (ms) between launch retries; doubled each retry. |
 | `ALLOW_PRIVATE_IPS` | `false` | Allow navigation to private/internal IPs (localhost, 192.168.x, etc.) — SSRF protection is enabled by default. |
 | `ALLOW_ALL_SCHEMES` | `false` | Allow all URL schemes (`file://`, `data://`, `javascript://`, etc.) — only `http`/`https` allowed by default. |
+| `HELA_BROWSER_ALLOW_EVAL` | *unset = off* | Set to `true` to allow `browser_evaluate` and `browser_assert` with `conditionType="js"` (R3 privilege). Off = denied. |
+| `HELA_ALLOWED_ROOTS` | *unset = off* | Colon-separated directory paths for Cytosol file output containment. If set, export/trace/download/session paths must resolve inside one of these roots. |
 | `HELA_ENVELOPE` | *unset = off* | Set to `true` to wrap tool results in the canonical HeLaResult envelope (`ok/summary/data/artifacts/provenance/warnings/sideEffects/execution`; captures report `sideEffects`, `export_state` stamps `state.provenance`, file outputs append `[sha256:<hex>]`). Off = byte-identical legacy output. Run/step ids propagate from `HELA_RUN_ID`/`HELA_STEP_ID`. |
 
 ### Browser Stability

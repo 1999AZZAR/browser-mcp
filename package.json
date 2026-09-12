@@ -13,7 +13,7 @@
   "scripts": {
     "mcp": "node src/server.js",
     "build": "echo 'No build step required for JS-only server'",
-    "test": "echo 'No tests defined yet'",
+    "test": "node test/browser-envelope.test.cjs && node test/cytosol-safety.test.cjs",
     "clean": "echo 'Nothing to clean'"
   }
 }

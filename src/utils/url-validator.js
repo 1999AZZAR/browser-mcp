@@ -115,15 +115,26 @@ function validateURL(urlStr, { allowPrivate = false, allowAllSchemes = false } =
 
 async function resolveAndValidate(hostname, { allowPrivate = false } = {}) {
     if (allowPrivate) return;
+    if (!hostname) throw new Error('Missing hostname for DNS validation');
+
+    const lower = hostname.toLowerCase();
+    if (BLOCKED_HOSTS.has(lower) || lower.endsWith('.local') || lower.endsWith('.internal')) {
+        throw new Error(`Access to ${hostname} is blocked (private/internal)`);
+    }
+
+    if (isPrivateIP(hostname)) {
+        throw new Error(`Private IP targets are blocked: ${hostname}`);
+    }
 
     return new Promise((resolve, reject) => {
-        dns.resolve4(hostname, (err, addresses) => {
+        dns.lookup(hostname, { all: true }, (err, addresses) => {
             if (err) {
-                // Could not resolve — treat as unsafe but don't block
+                // If hostname cannot be resolved, allow subsequent network call to handle error
                 resolve();
                 return;
             }
-            for (const addr of addresses) {
+            for (const item of addresses) {
+                const addr = typeof item === 'string' ? item : item.address;
                 if (isPrivateIP(addr)) {
                     reject(new Error(`DNS resolved to private IP ${addr} for ${hostname}`));
                     return;
@@ -135,3 +146,4 @@ async function resolveAndValidate(hostname, { allowPrivate = false } = {}) {
 }
 
 module.exports = { validateURL, resolveAndValidate, isPrivateIP, BLOCKED_SCHEMES, BLOCKED_HOSTS };
+
