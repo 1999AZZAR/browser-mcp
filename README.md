@@ -302,6 +302,31 @@ Register in your MCP client config:
 | `HELA_ALLOWED_ROOTS` | *unset = off* | Colon-separated directory paths for Cytosol file output containment. If set, export/trace/download/session paths must resolve inside one of these roots. |
 | `HELA_ENVELOPE` | *unset = off* | Set to `true` to wrap tool results in the canonical HeLaResult envelope (`ok/summary/data/artifacts/provenance/warnings/sideEffects/execution`; captures report `sideEffects`, `export_state` stamps `state.provenance`, file outputs append `[sha256:<hex>]`). Off = byte-identical legacy output. Run/step ids propagate from `HELA_RUN_ID`/`HELA_STEP_ID`. |
 
+### Enabling `browser_evaluate` (R3 privilege) + output roots
+
+`browser_evaluate` executes arbitrary JavaScript in the page, so it is **denied by default**.
+Set `HELA_BROWSER_ALLOW_EVAL=true` on the Cytosol server entry, then restart the
+harness (or its MCP servers). The key name depends on the harness:
+
+- **opencode** (`~/.config/opencode/opencode.json`) — `environment`:
+  ```json
+  "hela-cytosol": { "...": "...", "environment": { "HELA_BROWSER_ALLOW_EVAL": "true" } }
+  ```
+- **zed** (`context_servers` in `settings.json`) / **gemini** (`mcpServers`) — `env`:
+  ```json
+  "hela-cytosol": { "...": "...", "env": { "HELA_BROWSER_ALLOW_EVAL": "true" } }
+  ```
+
+Without the flag the tool returns `Evaluation blocked ...` with `isError: true` — that is
+the gate working, not a bug. Note: scripts need an explicit `return` (e.g.
+`return document.title`); a bare expression like `document.title` evaluates to `(undefined)`.
+
+`HELA_ALLOWED_ROOTS` (colon-separated, same `environment`/`env` key) confines where
+capture/export/session/trace/download paths may be written — symlink-aware, resolved
+against real paths. Example: `/home/azzar/project:/home/azzar/Documents:/home/azzar/Downloads:/tmp`.
+Paths outside the roots are rejected with `PolicyDeniedError`. When unset, only
+protected system prefixes (`/etc`, `/usr`, `/proc`, ...) are forbidden.
+
 ### Browser Stability
 
 The browser layer is hardened for long-running sessions:
